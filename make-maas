@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+
+"""Create a MAAS virtual test environment"""
+
+import logging
+import sys
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from contextlib import contextmanager
+from subprocess import PIPE, CalledProcessError, check_output
+from tempfile import NamedTemporaryFile
+from textwrap import dedent
+from typing import List, Mapping, Optional
+
+from netaddr import IPAddress, IPNetwork
+
+CONTAINER_IFACE = "maas"
+
+NETPLAN_CONF = dedent(
+    """\
+    network:
+      version: 2
+      ethernets:
+        {iface}:
+           dhcp4: false
+           dhcp6: false
+           addresses:
+               - {ipv4_address}
+               - {ipv6_address}
+    """
+)
+
+MAAS_SETUP = dedent(
+    """\
+    #!/bin/bash -e
+    snap wait system seed.loaded
+    snap install maas --channel {snap_channel}
+    snap install maas-test-db --channel {snap_channel}
+    maas init region+rack \\
+      --database-uri maas-test-db:/// \\
+      --maas-url {maas_url}
+    maas createadmin \\
+      --username {admin_username} \\
+      --password {admin_password} \\
+      --email {admin_username}@maas
+    maas login local {maas_url} $(maas apikey --username {admin_username})
+    """
+)
+
+
+LOGGER_RUN = logging.getLogger("run")
+LOGGER_LXD = logging.getLogger("lxd")
+LOGGER_MAAS = logging.getLogger("maas")
+
+DRY_RUN = False
+
+
+def get_args():
+    parser = ArgumentParser(
+        description=__doc__,
+        formatter_class=ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--admin-username",
+        help="MAAS admin username",
+        default="maas",
+    )
+    parser.add_argument(
+        "--admin-password",
+        help="MAAS admin password",
+        default="maas",
+    )
+    parser.add_argument(
+        "--ipv4-subnet",
+        help="IPv4 subnet for MAAS-managed machines",
+        default="172.16.100.1/24",
+    )
+    parser.add_argument(
+        "--ipv6-subnet",
+        help="IPv6 subnet for MAAS-managed machines",
+        default="fddf:cafe:cafe:cafe::1/64",
+    )
+    parser.add_argument(
+        "--lxd-network",
+        help="the LXD network to create for maas to use",
+        default="maas",
+    )
+    parser.add_argument(
+        "--maas-container",
+        help="name of the MAAS container to create",
+        default="maas",
+    )
+    parser.add_argument(
+        "--container-image",
+        help="name of the LXD image for the MAAS container",
+        default="f",
+    )
+    parser.add_argument(
+        "--maas-channel",
+        help="snap channel for MAAS install",
+        default="3.0/stable",
+    )
+    parser.add_argument(
+        "--dry-run",
+        help="only print out commands",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="print debug messages",
+    )
+    return parser.parse_args()
+
+
+def setup_logging(debug=False):
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
+
+
+def lxc(*args: str, opts: Optional[Mapping] = None):
+    cmd = ["lxc"]
+    cmd.extend(args)
+    LOGGER_RUN.debug(" ".join(cmd))
+    if not DRY_RUN:
+        return check_output(cmd, stderr=PIPE).decode()
+
+
+def lxc_push_file(container_name: str, content: str, dest_path: str, mode: str = ""):
+    with NamedTemporaryFile(buffering=0) as fd:
+        fd.write(content.encode())
+        command = ["file", "push", fd.name, container_name + dest_path]
+        if mode:
+            command.extend(["--mode", mode])
+        lxc(*command)
+
+
+def cli_opts(options: Mapping) -> List[str]:
+    return [f"{key}={value}" for key, value in options.items()]
+
+
+def setup_lxd_network(network: str, ipv4_network: IPNetwork, ipv6_network: IPNetwork):
+    LOGGER_LXD.info(f"setting up the {network} network in LXD")
+    net_config = {
+        "dns.mode": "none",
+        "ipv4.address": str(ipv4_network),
+        "ipv4.dhcp": "false",
+        "ipv6.address": str(ipv6_network),
+        "ipv6.dhcp": "false",
+    }
+    lxc(
+        "network",
+        "create",
+        network,
+        *cli_opts(net_config),
+    )
+
+
+def setup_maas_container(
+    container_name: str,
+    image_name: str,
+    network_name: str,
+    ipv4_address: IPNetwork,
+    ipv6_address: IPNetwork,
+):
+    LOGGER_LXD.info(f"creating the {container_name} container for MAAS")
+    lxc("init", image_name, container_name)
+    lxc(
+        "network",
+        "attach",
+        network_name,
+        container_name,
+        CONTAINER_IFACE,
+        CONTAINER_IFACE,
+    )
+    lxc("start", container_name)
+    lxc_push_file(
+        container_name,
+        NETPLAN_CONF.format(
+            iface=CONTAINER_IFACE,
+            ipv4_address=ipv4_address,
+            ipv6_address=ipv6_address,
+        ),
+        "/etc/netplan/50-maas.yaml",
+    )
+    lxc("exec", container_name, "--", "netplan", "apply")
+
+
+def install_maas(
+    container_name: str,
+    snap_channel: str,
+    maas_address: IPAddress,
+    admin_username: str,
+    admin_password: str,
+):
+    LOGGER_MAAS.info(f"installing maas in the {container_name} container")
+    script_path = "/root/setup-maas"
+    lxc_push_file(
+        container_name,
+        MAAS_SETUP.format(
+            snap_channel=snap_channel,
+            maas_url=f"http://{maas_address}:5240/MAAS",
+            admin_username=admin_username,
+            admin_password=admin_password,
+        ),
+        script_path,
+        mode="755",
+    )
+    lxc("exec", container_name, "--", script_path)
+    lxc("exec", container_name, "--", "rm", script_path)
+
+
+def setup_lxd(args):
+    ipv4_network = IPNetwork(args.ipv4_subnet)
+    ipv6_network = IPNetwork(args.ipv6_subnet)
+    net_ipv4 = addr_as_net(ipv4_network, 1)
+    net_ipv6 = addr_as_net(ipv6_network, 1)
+    maas_ipv4 = addr_as_net(ipv4_network, 2)
+    maas_ipv6 = addr_as_net(ipv6_network, 2)
+    setup_lxd_network(args.lxd_network, net_ipv4, net_ipv6)
+    setup_maas_container(
+        args.maas_container,
+        args.container_image,
+        args.lxd_network,
+        maas_ipv4,
+        maas_ipv6,
+    )
+    install_maas(
+        args.maas_container,
+        args.maas_channel,
+        maas_ipv4.ip,
+        args.admin_username,
+        args.admin_password,
+    )
+
+
+def addr_as_net(net: IPNetwork, index: int):
+    return IPNetwork(f"{net[index]}/{net.prefixlen}")
+
+
+@contextmanager
+def exit_on_failed_command():
+    try:
+        yield
+    except CalledProcessError as error:
+        LOGGER_RUN.error(
+            f"Command {error.cmd} failed:\n" + error.stderr.decode(),
+        )
+        sys.exit(1)
+
+
+def main():
+    args = get_args()
+    setup_logging(args.debug)
+    global DRY_RUN
+    DRY_RUN = args.dry_run
+    with exit_on_failed_command():
+        setup_lxd(args)
+
+
+if __name__ == "__main__":
+    main()
