@@ -6,7 +6,7 @@ import logging
 import sys
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from contextlib import contextmanager
-from subprocess import PIPE, CalledProcessError, check_output
+from subprocess import CalledProcessError, PIPE, run
 from tempfile import NamedTemporaryFile
 from textwrap import dedent
 from typing import List, Mapping, Optional
@@ -121,12 +121,15 @@ def setup_logging(debug=False):
     )
 
 
-def lxc(*args: str, opts: Optional[Mapping] = None):
+def lxc(*args: str, input: Optional[str] = None):
     cmd = ["lxc"]
     cmd.extend(args)
     LOGGER_RUN.debug(" ".join(cmd))
-    if not DRY_RUN:
-        return check_output(cmd, stderr=PIPE).decode()
+    if DRY_RUN:
+        return
+    process = run(cmd, input=input, stdout=PIPE, stderr=PIPE)
+    process.check_returncode()
+    return process.stdout.decode()
 
 
 def lxc_push_file(container_name: str, content: str, dest_path: str, mode: str = ""):
@@ -196,7 +199,7 @@ def install_maas(
     admin_username: str,
     admin_password: str,
 ):
-    LOGGER_MAAS.info(f"installing maas in the {container_name} container")
+    LOGGER_MAAS.info(f"installing MAAS in the {container_name} container")
     script_path = "/root/setup-maas"
     lxc_push_file(
         container_name,
