@@ -2,10 +2,11 @@
 
 """Create a MAAS virtual test environment"""
 
-import logging
-import sys
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from contextlib import contextmanager
+import json
+import logging
+import sys
 from subprocess import PIPE, CalledProcessError, run
 from tempfile import NamedTemporaryFile
 from textwrap import dedent
@@ -14,6 +15,8 @@ from typing import List, Mapping, Optional
 from netaddr import IPAddress, IPNetwork
 
 MAAS_VERSION_DEFAULT = "3.1"
+
+MAAS_CLI_PROFILE = "local"
 
 CONTAINER_IFACE = "maas"
 
@@ -47,7 +50,10 @@ MAAS_SETUP_COMMANDS = [
         "--password {admin_password} "
         "--email {admin_username}@maas"
     ),
-    "maas login local {maas_url} $(maas apikey --username {admin_username})",
+    (
+        "maas login {maas_cli_profile} {maas_url} "
+        "$(maas apikey --username {admin_username})"
+    ),
 ]
 
 
@@ -166,6 +172,12 @@ def setup_lxd_network(network: str, ipv4_network: IPNetwork, ipv6_network: IPNet
     )
 
 
+def maas(container_name: str, *args: str):
+    output = lxc("exec", container_name, "--", "maas", MAAS_CLI_PROFILE, *args)
+    if output:
+        return json.loads(output)
+
+
 def setup_maas_container(
     container_name: str,
     image_name: str,
@@ -207,10 +219,31 @@ def install_maas(
         command = command.format(
             snap_channel=snap_channel,
             maas_url=f"http://{maas_address}:5240/MAAS",
+            maas_cli_profile=MAAS_CLI_PROFILE,
             admin_username=admin_username,
             admin_password=admin_password,
         )
         lxc("exec", container_name, "--", "bash", "-c", command)
+
+
+def configure_maas(
+    container_name: str,
+    ipv4_address: IPNetwork,
+):
+    subnets = maas(container_name, "subnets", "read")
+    for subnet in subnets:
+        if subnet["cidr"] == str(ipv4_address.cidr):
+            break
+    subnet_id = subnet["id"]
+    fabric = subnet["vlan"]["fabric"]
+    vid = str(subnet["vlan"]["vid"])
+    maas(
+        container_name, "ipranges", "create", f"subnet={subnet_id}",
+        "type=dynamic", f"start_ip={ipv4_address[100]}", f"end_ip={ipv4_address[150]}",
+    )
+
+    system_id = maas(container_name, "region-controllers", "read")[0]["system_id"]
+    maas(container_name, "vlan", "update", fabric, vid, f"primary_rack={system_id}", "dhcp_on=true")
 
 
 def setup_lxd(args):
@@ -234,6 +267,10 @@ def setup_lxd(args):
         maas_ipv4.ip,
         args.admin_username,
         args.admin_password,
+    )
+    configure_maas(
+        args.maas_container,
+        net_ipv4,
     )
 
 
