@@ -33,6 +33,7 @@ MAAS_SETUP = dedent(
     """\
     #!/bin/bash -e
     snap wait system seed.loaded
+    snap refresh snapd || snap install snapd
     snap install maas --channel {snap_channel}
     snap install maas-test-db --channel {snap_channel}
     maas init region+rack \\
