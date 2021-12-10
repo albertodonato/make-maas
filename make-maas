@@ -31,23 +31,24 @@ NETPLAN_CONF = dedent(
     """
 )
 
-MAAS_SETUP = dedent(
-    """\
-    #!/bin/bash -e
-    snap wait system seed.loaded
-    snap refresh snapd || snap install snapd
-    snap install maas --channel {snap_channel}
-    snap install maas-test-db --channel {snap_channel}
-    maas init region+rack \\
-      --database-uri maas-test-db:/// \\
-      --maas-url {maas_url}
-    maas createadmin \\
-      --username {admin_username} \\
-      --password {admin_password} \\
-      --email {admin_username}@maas
-    maas login local {maas_url} $(maas apikey --username {admin_username})
-    """
-)
+MAAS_SETUP_COMMANDS = [
+    "snap wait system seed.loaded",
+    "snap refresh snapd || snap install snapd",
+    "snap install maas --channel {snap_channel}",
+    "snap install maas-test-db --channel {snap_channel}",
+    (
+        "maas init region+rack "
+        "--database-uri maas-test-db:/// "
+        "--maas-url {maas_url}"
+    ),
+    (
+        "maas createadmin "
+        "--username {admin_username} "
+        "--password {admin_password} "
+        "--email {admin_username}@maas"
+    ),
+    "maas login local {maas_url} $(maas apikey --username {admin_username})",
+]
 
 
 LOGGER_RUN = logging.getLogger("run")
@@ -202,20 +203,14 @@ def install_maas(
     admin_password: str,
 ):
     LOGGER_MAAS.info(f"installing MAAS in the {container_name} container")
-    script_path = "/root/setup-maas"
-    lxc_push_file(
-        container_name,
-        MAAS_SETUP.format(
+    for command in MAAS_SETUP_COMMANDS:
+        command = command.format(
             snap_channel=snap_channel,
             maas_url=f"http://{maas_address}:5240/MAAS",
             admin_username=admin_username,
             admin_password=admin_password,
-        ),
-        script_path,
-        mode="755",
-    )
-    lxc("exec", container_name, "--", script_path)
-    lxc("exec", container_name, "--", "rm", script_path)
+        )
+        lxc("exec", container_name, "--", "bash", "-c", command)
 
 
 def setup_lxd(args):
