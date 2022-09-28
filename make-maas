@@ -61,8 +61,6 @@ LOGGER_RUN = logging.getLogger("run")
 LOGGER_LXD = logging.getLogger("lxd")
 LOGGER_MAAS = logging.getLogger("maas")
 
-DRY_RUN = False
-
 
 def get_args():
     parser = ArgumentParser(
@@ -110,16 +108,10 @@ def get_args():
         default=f"{MAAS_VERSION_DEFAULT}/stable",
     )
     parser.add_argument(
-        "--dry-run",
-        help="only print out commands",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
         "--debug",
+        help="print debug messages",
         action="store_true",
         default=False,
-        help="print debug messages",
     )
     return parser.parse_args()
 
@@ -135,8 +127,6 @@ def lxc(*args: str, input: Optional[str] = None):
     cmd = ["lxc"]
     cmd.extend(args)
     LOGGER_RUN.debug(" ".join(cmd))
-    if DRY_RUN:
-        return
     process = run(cmd, input=input, stdout=PIPE, stderr=PIPE)
     process.check_returncode()
     return process.stdout.decode()
@@ -292,8 +282,6 @@ def exit_on_failed_command():
 def main():
     args = get_args()
     setup_logging(args.debug)
-    global DRY_RUN
-    DRY_RUN = args.dry_run
     with exit_on_failed_command():
         setup_lxd(args)
 
